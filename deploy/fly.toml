@@ -1,0 +1,78 @@
+# Fly.io deployment configuration for UpNews platform
+# Deploy with: flyctl deploy -c deploy/fly.toml
+
+app = "upnews-platform"
+primary_region = "iad"
+
+[build]
+  # Use Docker to build from Dockerfile
+  dockerfile = "./docker/api.Dockerfile"
+
+[env]
+  DATABASE_URL = "libsql://your-db.turso.io"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  processes = ["web"]
+
+[http_service.checks]
+  [http_service.checks.health]
+    interval = "10s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    timeout = "5s"
+
+[[services]]
+  protocol = "http"
+  internal_port = 8000
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+  processes = ["web"]
+
+# Scheduled pipeline crawl job (runs every 4 hours)
+[[processes]]
+  name = "crawl"
+  cmd = "python -m upnews_pipeline.crawl"
+  auto_start = false
+  auto_stop = true
+
+[cron_checks]
+  [cron_checks.crawl]
+    schedule = "0 */4 * * *"
+    timeout = "1h"
+
+[deploy]
+  # Auto-deploy on main branch push
+  release_command = "python -m upnews.db_upgrade"
+  strategy = "canary"
+  wait_timeout = "300s"
+
+[[statics]]
+  guest_path = "/frontend"
+  url_prefix = "/frontend"
+  paths = ["frontend/dist"]
+
+[env]
+  TURSO_URL = "libsql://upnews-db.turso.io"
+
+[env.staging]
+  DATABASE_URL = "sqlite:///./upnews.db"
+  LOG_LEVEL = "debug"
+
+[[metrics]]
+  port = 9091
+  path = "/metrics"

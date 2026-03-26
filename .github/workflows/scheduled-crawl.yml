@@ -1,0 +1,90 @@
+name: Scheduled Pipeline Crawl
+
+on:
+  schedule:
+    # Every 4 hours UTC: 0, 4, 8, 12, 16, 20
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    name: Run news crawl and feed processing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build pipeline Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/pipeline.Dockerfile
+          load: true
+          tags: upnews-pipeline:latest
+
+      - name: Run pipeline crawler (attempt 1)
+        id: crawl
+        env:
+          DATABASE_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          LOG_LEVEL: info
+        run: |
+          docker run --rm \
+            -e DATABASE_URL \
+            -e TURSO_TOKEN \
+            -e LOG_LEVEL \
+            upnews-pipeline:latest
+        continue-on-error: true
+
+      - name: Run pipeline crawler (retry on failure)
+        if: steps.crawl.outcome == 'failure'
+        env:
+          DATABASE_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          LOG_LEVEL: info
+        run: |
+          echo "First attempt failed, retrying in 5 minutes..."
+          sleep 300
+          docker run --rm \
+            -e DATABASE_URL \
+            -e TURSO_TOKEN \
+            -e LOG_LEVEL \
+            upnews-pipeline:latest
+
+      - name: Report success to monitoring service
+        if: success()
+        env:
+          HEALTHCHECKS_URL: ${{ secrets.HEALTHCHECKS_CRAWL_URL }}
+        run: |
+          if [ -n "$HEALTHCHECKS_URL" ]; then
+            curl -m 10 --retry 5 "$HEALTHCHECKS_URL"
+          fi
+        continue-on-error: true
+
+      - name: Report failure to monitoring service
+        if: failure()
+        env:
+          HEALTHCHECKS_URL_FAIL: ${{ secrets.HEALTHCHECKS_CRAWL_URL_FAIL }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$HEALTHCHECKS_URL_FAIL" ]; then
+            curl -m 10 --retry 5 "$HEALTHCHECKS_URL_FAIL"
+          fi
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            curl -X POST "$SLACK_WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"text\": \"UpNews pipeline crawl failed. Check: https://github.com/News-Uplifters/upnews-infra/actions\"}"
+          fi
+        continue-on-error: true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: crawl-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+        continue-on-error: true

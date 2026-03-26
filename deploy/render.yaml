@@ -1,0 +1,61 @@
+services:
+  - type: web
+    name: upnews-api
+    runtime: docker
+    dockerfilePath: docker/api.Dockerfile
+    region: oregon
+    plan: free
+    numInstances: 1
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        value: libsql://upnews-db.turso.io
+      - key: TURSO_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: info
+
+  - type: web
+    name: upnews-frontend
+    runtime: docker
+    dockerfilePath: docker/frontend.Dockerfile
+    region: oregon
+    plan: free
+    numInstances: 1
+    healthCheckPath: /health
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://upnews-api.onrender.com
+      - key: NODE_ENV
+        value: production
+
+  - type: cron
+    name: upnews-pipeline-crawl
+    runtime: docker
+    dockerfilePath: docker/pipeline.Dockerfile
+    region: oregon
+    schedule: "0 */4 * * *"
+    envVars:
+      - key: DATABASE_URL
+        value: libsql://upnews-db.turso.io
+      - key: TURSO_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: info
+      - key: ML_MODEL
+        value: distilbert-base-uncased
+      - key: MAX_ARTICLES_PER_FEED
+        value: "50"
+
+databases:
+  - name: upnews-db
+    databaseType: sqlite
+    plan: free
+
+envVarGroups:
+  - name: turso-secrets
+    envVars:
+      - key: TURSO_TOKEN
+        sync: false
+      - key: TURSO_URL
+        value: libsql://upnews-db.turso.io
