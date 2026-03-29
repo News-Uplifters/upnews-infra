@@ -1,56 +1,66 @@
 version: '3.8'
 
+# Run from the upnews-infra directory:
+#   docker-compose up --build
+#
+# Each service builds from its own repo (sibling directories).
+# Shared SQLite database is mounted into both api and pipeline via the
+# "db-data" named volume so both services read/write the same file.
+
 services:
   api:
     build:
-      context: .
-      dockerfile: docker/api.Dockerfile
+      context: ../upnews-api      # builds using upnews-api/Dockerfile
+      dockerfile: Dockerfile
     container_name: upnews-api
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=sqlite:///./data/upnews.db
-      - LOG_LEVEL=info
+      - DATABASE_URL=./data/upnews.db
+      - LOG_LEVEL=INFO
+      - CORS_ORIGINS=http://localhost:80,http://localhost
     volumes:
-      - ./data:/app/data
+      - db-data:/app/data          # shared DB volume
     networks:
       - upnews-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
   pipeline:
     build:
-      context: .
-      dockerfile: docker/pipeline.Dockerfile
+      context: ../upnews-pipeline  # builds using upnews-pipeline/Dockerfile
+      dockerfile: Dockerfile
     container_name: upnews-pipeline
     environment:
-      - DATABASE_URL=sqlite:///./data/upnews.db
+      - DATABASE_PATH=data/articles.db
       - CRAWL_INTERVAL_HOURS=4
-      - ML_MODEL=distilbert-base-uncased
       - MAX_ARTICLES_PER_FEED=50
+      - LOG_LEVEL=INFO
     volumes:
-      - ./data:/app/data
+      - db-data:/app/data          # shares DB with api
+      - pipeline-logs:/app/logs
     depends_on:
       api:
         condition: service_healthy
     networks:
       - upnews-network
-    # Run once on startup; use scheduled job in production
-    command: python -m upnews_pipeline.crawl
+    # Runs once on startup; in production use the scheduled GitHub Action
+    command: python -m pipeline.run_pipeline
 
   frontend:
     build:
-      context: .
-      dockerfile: docker/frontend.Dockerfile
+      context: ../upnews-frontend  # builds using upnews-frontend/Dockerfile
+      dockerfile: Dockerfile
     container_name: upnews-frontend
     ports:
       - "80:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - upnews-network
     healthcheck:
@@ -58,10 +68,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
 volumes:
-  db:
+  db-data:
+    driver: local                  # SQLite file shared between api and pipeline
+  pipeline-logs:
     driver: local
 
 networks:
