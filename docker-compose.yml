@@ -1,69 +1,82 @@
-version: '3.8'
+# UpNews Local Stack
+#
+# Run from this directory (upnews-infra/) with all repos cloned as siblings:
+#
+#   parent-dir/
+#   ├── upnews-api/
+#   ├── upnews-pipeline/
+#   ├── upnews-frontend/
+#   └── upnews-infra/          <-- run docker compose from here
+#
+# Quick start:
+#   ./scripts/run-local.sh              # full e2e: build → start → crawl → validate
+#
+# Manual usage:
+#   docker compose up --build -d        # start API + frontend
+#   docker compose --profile crawl run --rm pipeline   # run one crawl
+#   docker compose down -v              # stop + clean volumes
 
 services:
   api:
     build:
-      context: .
-      dockerfile: docker/api.Dockerfile
+      context: ../upnews-api
+      dockerfile: Dockerfile
     container_name: upnews-api
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=sqlite:///./data/upnews.db
-      - LOG_LEVEL=info
+      - DATABASE_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - CORS_ORIGINS=http://localhost,http://localhost:3000
     volumes:
-      - ./data:/app/data
+      - upnews-data:/app/data
     networks:
-      - upnews-network
+      default:
+        # Frontend nginx.conf proxies /api/ to "backend:8000"
+        # This alias makes "api" reachable as "backend" inside the network
+        aliases:
+          - backend
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   pipeline:
     build:
-      context: .
-      dockerfile: docker/pipeline.Dockerfile
+      context: ../upnews-pipeline
+      dockerfile: Dockerfile
     container_name: upnews-pipeline
     environment:
-      - DATABASE_URL=sqlite:///./data/upnews.db
-      - CRAWL_INTERVAL_HOURS=4
-      - ML_MODEL=distilbert-base-uncased
-      - MAX_ARTICLES_PER_FEED=50
+      - DATABASE_PATH=/app/data/upnews.db
+      - LOG_LEVEL=INFO
+      - ARTICLES_LIMIT_PER_SOURCE=20
+      - CLASSIFICATION_THRESHOLD=0.75
+      - CLASSIFIER_MODE=rules
     volumes:
-      - ./data:/app/data
+      - upnews-data:/app/data
     depends_on:
       api:
         condition: service_healthy
-    networks:
-      - upnews-network
-    # Run once on startup; use scheduled job in production
-    command: python -m upnews_pipeline.crawl
+    # Pipeline runs on-demand — not auto-started with `docker compose up`
+    profiles:
+      - crawl
 
   frontend:
     build:
-      context: .
-      dockerfile: docker/frontend.Dockerfile
+      context: ../upnews-frontend
+      dockerfile: Dockerfile
     container_name: upnews-frontend
     ports:
-      - "80:80"
+      - "3000:80"
+    environment:
+      # /api is the default; nginx proxies it to the api service via the "backend" alias
+      - API_URL=/api
     depends_on:
-      - api
-    networks:
-      - upnews-network
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+      api:
+        condition: service_healthy
 
 volumes:
-  db:
+  upnews-data:
     driver: local
-
-networks:
-  upnews-network:
-    driver: bridge
