@@ -52,7 +52,7 @@ services:
       - DATABASE_PATH=/app/data/upnews.db
       - LOG_LEVEL=INFO
       - ARTICLES_LIMIT_PER_SOURCE=20
-      - CLASSIFICATION_THRESHOLD=0.75
+      - CLASSIFICATION_THRESHOLD=0.3
       - CLASSIFIER_MODE=rules
     volumes:
       - upnews-data:/app/data
@@ -70,9 +70,7 @@ services:
     container_name: upnews-frontend
     ports:
       - "3000:80"
-    environment:
-      # /api is the default; nginx proxies it to the api service via the "backend" alias
-      - API_URL=/api
+    environment: []
     depends_on:
       api:
         condition: service_healthy
