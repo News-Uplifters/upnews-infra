@@ -54,11 +54,18 @@ services:
       - ARTICLES_LIMIT_PER_SOURCE=20
       - CLASSIFICATION_THRESHOLD=0.3
       - CLASSIFIER_MODE=rules
+      # When running with --profile ml, the pipeline will call the inference
+      # service. Falls back to local rule-based models when not set.
+      - INFERENCE_SERVICE_URL=http://upnews-inference:8001
+      - INFERENCE_TIMEOUT_SEC=30
     volumes:
       - upnews-data:/app/data
     depends_on:
       api:
         condition: service_healthy
+      inference:
+        condition: service_healthy
+        required: false   # pipeline still runs without --profile ml
     # Pipeline runs on-demand — not auto-started with `docker compose up`
     profiles:
       - crawl
@@ -75,6 +82,33 @@ services:
       api:
         condition: service_healthy
 
+  inference:
+    build:
+      context: ../upnews-inference
+      dockerfile: Dockerfile
+    container_name: upnews-inference
+    ports:
+      - "8001:8001"
+    environment:
+      - LOG_LEVEL=INFO
+      - ORT_NUM_THREADS=2
+      - CLASSIFIER_MODEL_PATH=/app/onnx_models/uplifting_classifier
+      - CATEGORIZER_MODEL_PATH=/app/onnx_models/topic_categorizer
+      - SUMMARIZER_MODEL_PATH=/app/onnx_models/summarizer
+    volumes:
+      - upnews-onnx-models:/app/onnx_models
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    # opt-in profile: docker compose --profile ml up
+    profiles:
+      - ml
+
 volumes:
   upnews-data:
+    driver: local
+  upnews-onnx-models:
     driver: local
