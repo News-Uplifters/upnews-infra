@@ -3,25 +3,37 @@
 # Run from this directory (upnews-infra/) with all repos cloned as siblings:
 #
 #   parent-dir/
-#   ├── upnews-api/
+#   ├── upnews-api/              # Python FastAPI (legacy, SQLite)
+#   ├── upnews-api-rust/         # Rust Axum (new, Postgres)
 #   ├── upnews-pipeline/
 #   ├── upnews-frontend/
-#   └── upnews-infra/          <-- run docker compose from here
+#   └── upnews-infra/            <-- run docker compose from here
 #
-# Quick start:
-#   ./scripts/run-local.sh              # full e2e: build → start → crawl → validate
+# Two parallel stacks share the frontend network alias `backend:8000` so the
+# React app hits whichever API is currently running. Only ONE API profile
+# should be active at a time.
+#
+# Quick start (legacy Python stack):
+#   ./scripts/run-local.sh                                     # Python + SQLite e2e
+#
+# Quick start (new Rust stack):
+#   ./scripts/run-local-rust.sh                                # Rust + Postgres e2e
 #
 # Manual usage:
-#   docker compose up --build -d        # start API + frontend
-#   docker compose --profile crawl run --rm pipeline   # run one crawl
-#   docker compose down -v              # stop + clean volumes
+#   docker compose --profile python up --build -d             # Python API + frontend
+#   docker compose --profile rust   up --build -d             # Rust API + Postgres + frontend
+#   docker compose --profile crawl      run --rm pipeline     # one crawl (writes to SQLite)
+#   docker compose --profile crawl-rust run --rm pipeline-rust # one crawl (writes to Postgres)
+#   docker compose down -v                                     # stop + clean volumes
 
 services:
+  # ───────────────────────── Python API (legacy) ─────────────────────────
   api:
     build:
       context: ../upnews-api
       dockerfile: Dockerfile
     container_name: upnews-api
+    profiles: ["python"]
     ports:
       - "8000:8000"
     environment:
@@ -32,8 +44,6 @@ services:
       - upnews-data:/app/data
     networks:
       default:
-        # Frontend nginx.conf proxies /api/ to "backend:8000"
-        # This alias makes "api" reachable as "backend" inside the network
         aliases:
           - backend
     healthcheck:
@@ -48,6 +58,7 @@ services:
       context: ../upnews-pipeline
       dockerfile: Dockerfile
     container_name: upnews-pipeline
+    profiles: ["crawl"]
     environment:
       - DATABASE_PATH=/app/data/upnews.db
       - LOG_LEVEL=INFO
@@ -59,22 +70,82 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    # Pipeline runs on-demand — not auto-started with `docker compose up`
-    profiles:
-      - crawl
 
+  # ───────────────────────── Rust API (new) + Postgres ─────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: upnews-postgres
+    profiles: ["rust", "crawl-rust"]
+    environment:
+      - POSTGRES_USER=upnews
+      - POSTGRES_PASSWORD=upnews
+      - POSTGRES_DB=upnews
+    ports:
+      - "5432:5432"
+    volumes:
+      - upnews-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U upnews -d upnews"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api-rust:
+    build:
+      context: ../upnews-api-rust
+      dockerfile: Dockerfile
+    container_name: upnews-api-rust
+    profiles: ["rust"]
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgres://upnews:upnews@postgres:5432/upnews
+      - UPNEWS__HOST=0.0.0.0
+      - UPNEWS__PORT=8000
+      - UPNEWS__LOG_LEVEL=info
+      - UPNEWS__LOG_FORMAT=json
+      - UPNEWS__CORS_ORIGINS=http://localhost,http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - backend
+    # The distroless runtime has no shell/curl, so we don't define an in-container
+    # healthcheck — run-local-rust.sh polls /api/health from the host instead.
+
+  pipeline-rust:
+    build:
+      context: ../upnews-pipeline
+      dockerfile: Dockerfile
+    container_name: upnews-pipeline-rust
+    profiles: ["crawl-rust"]
+    environment:
+      # Pipeline writes directly to Postgres when DATABASE_URL is set.
+      # (See upnews-pipeline issue — fallback to SQLite if unset.)
+      - DATABASE_URL=postgres://upnews:upnews@postgres:5432/upnews
+      - LOG_LEVEL=INFO
+      - ARTICLES_LIMIT_PER_SOURCE=20
+      - CLASSIFICATION_THRESHOLD=0.3
+      - CLASSIFIER_MODE=rules
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ───────────────────────── Frontend (shared) ─────────────────────────
   frontend:
     build:
       context: ../upnews-frontend
       dockerfile: Dockerfile
     container_name: upnews-frontend
+    profiles: ["python", "rust"]
     ports:
       - "3000:80"
-    environment: []
-    depends_on:
-      api:
-        condition: service_healthy
 
 volumes:
   upnews-data:
+    driver: local
+  upnews-pgdata:
     driver: local

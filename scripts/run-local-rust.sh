@@ -2,20 +2,23 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────
-# UpNews Local E2E
+# UpNews Local E2E — Rust API + Postgres
 #
-# Builds and starts the full stack, runs one pipeline crawl,
-# and validates that articles appear in the API.
+# Builds and starts the new Rust stack (Axum + Postgres + frontend),
+# runs one pipeline crawl (Postgres variant), and validates that
+# articles appear in the API.
 #
 # Prerequisites:
 #   - Docker + Docker Compose v2
 #   - All repos cloned as siblings:
 #
 #   parent-dir/
-#   ├── upnews-api/
+#   ├── upnews-api-rust/     <-- new Rust API
 #   ├── upnews-pipeline/
 #   ├── upnews-frontend/
 #   └── upnews-infra/        <-- run this script from here
+#
+# Use scripts/run-local.sh for the legacy Python + SQLite stack.
 # ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -50,7 +53,7 @@ if ! docker compose version &>/dev/null 2>&1; then
 fi
 
 MISSING=()
-for repo in upnews-api upnews-pipeline upnews-frontend; do
+for repo in upnews-api-rust upnews-pipeline upnews-frontend; do
     if [ ! -d "${PARENT_DIR}/${repo}" ]; then
         MISSING+=("$repo")
     fi
@@ -60,7 +63,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     fail "Missing sibling repos: ${MISSING[*]}"
     echo "  Expected layout:"
     echo "    $(basename "$PARENT_DIR")/"
-    echo "    ├── upnews-api/"
+    echo "    ├── upnews-api-rust/"
     echo "    ├── upnews-pipeline/"
     echo "    ├── upnews-frontend/"
     echo "    └── upnews-infra/  <-- you are here"
@@ -74,60 +77,58 @@ echo ""
 
 # ── Step 1: Build images ─────────────────────────────────────
 
-info "[1/5] Building images (this may take a few minutes on first run)..."
-docker compose --profile python build --parallel
+info "[1/5] Building images (first Rust build can take 3–6 min for cargo-chef cache)..."
+docker compose --profile rust build --parallel
 echo ""
 
-# ── Step 2: Start API + Frontend ─────────────────────────────
+# ── Step 2: Start Postgres + Rust API + Frontend ─────────────
 
-info "[2/5] Starting API + Frontend (Python stack)..."
-docker compose --profile python up -d
+info "[2/5] Starting Postgres + Rust API + Frontend..."
+docker compose --profile rust up -d
 echo ""
 
-# ── Step 3: Wait for API health ───────────────────────────────
+# ── Step 3: Wait for API health (from host, distroless has no shell) ──
 
-info "[3/5] Waiting for API to become healthy..."
+info "[3/5] Waiting for /api/health to respond..."
 MAX_WAIT=60
+HEALTHY=0
 for i in $(seq 1 $MAX_WAIT); do
-    STATUS=$(docker inspect --format='{{.State.Health.Status}}' upnews-api 2>/dev/null || echo "starting")
-    if [ "$STATUS" = "healthy" ]; then
+    if curl -sf http://localhost:8000/api/health >/dev/null 2>&1; then
         ok "API is healthy (took ${i}s)"
+        HEALTHY=1
         break
-    fi
-    if [ "$i" -eq "$MAX_WAIT" ]; then
-        fail "API did not become healthy within ${MAX_WAIT}s"
-        echo ""
-        echo "── API logs ──"
-        docker compose logs api --tail 30
-        echo ""
-        echo "Tip: docker compose logs api"
-        exit 1
     fi
     printf "  waiting... (%ds)\r" "$i"
     sleep 1
 done
 
-API_RESP=$(curl -sf http://localhost:8000/api/health 2>/dev/null || echo "")
-if echo "$API_RESP" | grep -q "healthy"; then
-    ok "API health endpoint responding"
-else
-    warn "API container is healthy but /api/health returned unexpected response"
-    echo "  Response: $API_RESP"
+if [ "$HEALTHY" -ne 1 ]; then
+    fail "API did not become healthy within ${MAX_WAIT}s"
+    echo ""
+    echo "── api-rust logs ──"
+    docker compose logs api-rust --tail 40
+    echo ""
+    echo "── postgres logs ──"
+    docker compose logs postgres --tail 20
+    exit 1
 fi
+
+API_RESP=$(curl -sf http://localhost:8000/api/health 2>/dev/null || echo "")
+echo "  Response: $API_RESP"
 echo ""
 
-# ── Step 4: Run the pipeline ─────────────────────────────────
+# ── Step 4: Run the pipeline (Postgres variant) ──────────────
 
-info "[4/5] Running pipeline crawl (fetching news articles)..."
+info "[4/5] Running pipeline crawl against Postgres..."
 echo "  This takes 1–3 minutes on first run."
 echo ""
 
-if docker compose --profile crawl run --rm pipeline 2>&1 | tee /tmp/upnews-pipeline.log | tail -20; then
+if docker compose --profile crawl-rust run --rm pipeline-rust 2>&1 | tee /tmp/upnews-pipeline-rust.log | tail -20; then
     ok "Pipeline completed successfully"
 else
     PIPELINE_EXIT=$?
     warn "Pipeline exited with code $PIPELINE_EXIT"
-    echo "  Full log: /tmp/upnews-pipeline.log"
+    echo "  Full log: /tmp/upnews-pipeline-rust.log"
     echo "  (Continuing — some articles may have been stored despite the error)"
 fi
 echo ""
@@ -136,22 +137,23 @@ echo ""
 
 info "[5/5] Validating end-to-end..."
 
-ARTICLES_JSON=$(curl -sf http://localhost:8000/api/articles 2>/dev/null || echo "")
+ARTICLES_JSON=$(curl -sf 'http://localhost:8000/api/articles?page=1&limit=20' 2>/dev/null || echo "")
 ARTICLE_COUNT=0
 if [ -n "$ARTICLES_JSON" ]; then
     ARTICLE_COUNT=$(echo "$ARTICLES_JSON" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
-    if 'meta' in data and 'total_count' in data['meta']:
-        print(data['meta']['total_count'])
+    # Rust API returns FLAT shape: {articles, page, limit, total, total_pages}
+    if 'total' in data:
+        print(data['total'])
+    elif 'articles' in data and isinstance(data['articles'], list):
+        print(len(data['articles']))
     elif 'data' in data and isinstance(data['data'], list):
         print(len(data['data']))
-    elif isinstance(data, list):
-        print(len(data))
     else:
         print(0)
-except:
+except Exception:
     print(0)
 " 2>/dev/null || echo "0")
 fi
@@ -162,25 +164,31 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [ "$ARTICLE_COUNT" -gt 0 ] && [ "$FRONTEND_STATUS" = "200" ]; then
-    echo -e "${GREEN}  END-TO-END TEST PASSED${NC}"
+    echo -e "${GREEN}  END-TO-END TEST PASSED (Rust stack)${NC}"
 else
-    echo -e "${YELLOW}  PARTIAL SUCCESS${NC}"
+    echo -e "${YELLOW}  PARTIAL SUCCESS (Rust stack)${NC}"
 fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
+echo "  Stack:           Rust Axum + Postgres 16"
 echo "  Articles in DB:  $ARTICLE_COUNT"
 echo "  Frontend HTTP:   $FRONTEND_STATUS"
 echo ""
-echo "  Frontend:  http://localhost:3000"
-echo "  API:       http://localhost:8000/api/articles"
-echo "  API docs:  http://localhost:8000/docs"
+echo "  Frontend:        http://localhost:3000"
+echo "  API:             http://localhost:8000/api/articles"
+echo "  API health:      http://localhost:8000/api/health"
+echo "  Postgres:        postgres://upnews:upnews@localhost:5432/upnews"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "  Useful commands:"
-echo "    docker compose logs api                               # API logs"
-echo "    docker compose logs frontend                          # Frontend logs"
-echo "    docker compose --profile crawl run --rm pipeline      # Run another crawl"
-echo "    docker compose down -v                                # Stop + remove volumes"
+echo "    docker compose logs api-rust                                # Rust API logs"
+echo "    docker compose logs postgres                                # Postgres logs"
+echo "    docker compose --profile crawl-rust run --rm pipeline-rust  # another crawl"
+echo "    docker compose --profile rust down -v                       # stop + clean volumes"
+echo ""
+echo "  To switch back to the Python stack:"
+echo "    docker compose --profile rust down"
+echo "    ./scripts/run-local.sh"
 echo ""
