@@ -38,6 +38,13 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; }
 
+# ── Idempotency: tear down any previous run ─────────────────
+
+info "Tearing down any previous Rust stack run..."
+docker compose --profile rust --profile crawl-rust down -v --remove-orphans 2>/dev/null || true
+ok "Previous run cleaned up (or nothing was running)."
+echo ""
+
 # ── Preflight checks ────────────────────────────────────────
 
 info "Checking prerequisites..."
