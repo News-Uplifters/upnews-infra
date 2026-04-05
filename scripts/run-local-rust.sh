@@ -85,7 +85,7 @@ echo ""
 # ── Step 1: Build images ─────────────────────────────────────
 
 info "[1/5] Building images (first Rust build can take 3–6 min for cargo-chef cache)..."
-docker compose --profile rust build --parallel
+docker compose --profile rust --profile crawl-rust build --parallel
 echo ""
 
 # ── Step 2: Start Postgres + Rust API + Frontend ─────────────
